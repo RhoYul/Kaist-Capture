@@ -66,13 +66,26 @@ class Capture:
         cams=self.cameras()
         if len(cams)!=4 or not all(c.get('connected') for c in cams): raise ValueError('카메라 4대가 모두 연결되어야 합니다')
         return cams
+    def _demo_frame(self,cam):
+        image=np.full((self.cfg['capture_height'],self.cfg['capture_width'],3),(26,35,48),np.uint8)
+        cv2.putText(image,'DEMO  /  '+cam,(40,220),cv2.FONT_HERSHEY_SIMPLEX,1,(130,230,200),2)
+        cv2.putText(image,time.strftime('%H:%M:%S')+'.%02d'%int(time.time()*100%100),(40,270),cv2.FONT_HERSHEY_SIMPLEX,0.8,(130,230,200),2)
+        return cv2.imencode('.jpg',image)[1].tobytes()
     def frame(self,cam):
-        if self.cfg['demo']:
-            image=np.full((self.cfg['capture_height'],self.cfg['capture_width'],3),(26,35,48),np.uint8)
-            cv2.putText(image,'DEMO  /  '+cam,(40,220),cv2.FONT_HERSHEY_SIMPLEX,1,(130,230,200),2)
-            return cv2.imencode('.jpg',image)[1].tobytes()
+        if self.cfg['demo']: return self._demo_frame(cam)
         self.cameras(); obj=self.preview._cameras.get(cam)  # 녹화 중에도 같은 스트림의 미리보기
         return obj.get_frame_jpeg() if obj else None
+    def preview_frames(self):
+        """미리보기 스트림용: 카메라 4대의 최신 JPEG {cam: bytes|None}. 새 프레임이 없으면 지난번과 같은 bytes 객체를 돌려준다."""
+        if self.cfg['demo']:
+            tick=int(time.time()*15)   # 데모는 화면 15fps 에 맞춰 새 프레임
+            if getattr(self,'_demo_tick',None)!=tick:
+                self._demo_tick=tick; self._demo_frames={c:self._demo_frame(c) for c in CAMERAS}
+            return dict(self._demo_frames)
+        if self.preview is None: self.cameras()   # 처음 한 번 카메라 열기
+        if self.preview is None: return {}
+        cams=self.preview._cameras
+        return {c:(cams[c].get_frame_jpeg() if c in cams else None) for c in CAMERAS}
     def snapshot(self):
         with self.lock:
             if self.busy: raise ValueError('현재 작업 완료 후 캡처하세요')
@@ -227,9 +240,10 @@ class Capture:
     # 같은 PC export 서버가 있으면 QC 를 거기 대기열에 맡긴다 (촬영 서버는 촬영만 · 녹화하면 QC 가 잠깐 멈춤).
     # QC 전체 PASS 는 자동 승인 · NAS 전송, WARN · FAIL 이 하나라도 있으면 작업자 검수를 기다린다.
     PENDING=('captured','qc_queued','qc_running','qc_done')
-    def pending_episodes(self):
-        """아직 NAS 로 보내지 않은 촬영 (QC 전 · QC 중 · 검수 대기). max_pending 개가 쌓이면 촬영을 막는다."""
-        return [e for e in self.db.all('episode') if e.get('status') in self.PENDING and not e.get('export_job') and not e.get('local_deleted')]
+    def pending_episodes(self,eps=None):
+        """아직 NAS 로 보내지 않은 촬영 (QC 전 · QC 중 · 검수 대기). max_pending 개가 쌓이면 촬영을 막는다.
+        eps: 이미 읽어 둔 에피소드 목록 (상태 화면이 한 번 읽어 같이 쓴다)."""
+        return [e for e in (self.db.all('episode') if eps is None else eps) if e.get('status') in self.PENDING and not e.get('export_job') and not e.get('local_deleted')]
     def qc_remote(self): return self.export_is_local()
     def qc(self,key):
         with self.lock:
@@ -255,26 +269,28 @@ class Capture:
     def _queue_qc(self,key,ep):
         self._export('POST','/api/qc/'+key+'/local',timeout=10,json=dict(path=str((self.root/'episodes'/key).resolve()),scene=ep.get('scene','3D'),station=self.cfg['station']))
         self.db.patch('episode',key,status='qc_queued',review=None,error=None)
-    def reconcile_qc(self,qc_list):
-        """export 서버의 QC 결과를 받아 반영한다 (상태 갱신 · 하트비트에서 부른다)."""
-        by_id={q.get('id'):q for q in qc_list or []}
-        for ep in self.db.all('episode'):
+    def reconcile_qc(self,qc_list,eps=None):
+        """export 서버의 QC 결과를 받아 반영한다 (상태 갱신 · 하트비트에서 부른다). 에피소드를 바꿨으면 True.
+        eps: 이미 읽어 둔 에피소드 목록 (바꿀 때는 DB 에서 다시 읽어 확인한다)."""
+        by_id={q.get('id'):q for q in qc_list or []}; changed=False
+        for ep in (self.db.all('episode') if eps is None else eps):
             if ep.get('status') not in ('qc_queued','qc_running') or ep.get('local_deleted'): continue
             q=by_id.get(ep['id'])
             if not q:
                 # export 서버에 기록이 없다 (export 서버 설정을 새로 만든 경우 등) → 다시 맡긴다
                 if self.qc_remote():
-                    try: self._queue_qc(ep['id'],ep)
+                    try: self._queue_qc(ep['id'],ep); changed=True
                     except Exception: pass
                 continue
             with self.lock:
                 cur=self.db.get('episode',ep['id'])
-                if cur.get('status') not in ('qc_queued','qc_running'): continue
-                if q['status']=='running' and cur['status']!='qc_running': self.db.patch('episode',ep['id'],status='qc_running')
-                elif q['status']=='queued' and cur['status']!='qc_queued': self.db.patch('episode',ep['id'],status='qc_queued')
-                elif q['status']=='done': self._finish_qc(ep['id'],q.get('result') or {},q.get('seconds'))
+                if not cur or cur.get('status') not in ('qc_queued','qc_running'): continue
+                if q['status']=='running' and cur['status']!='qc_running': self.db.patch('episode',ep['id'],status='qc_running'); changed=True
+                elif q['status']=='queued' and cur['status']!='qc_queued': self.db.patch('episode',ep['id'],status='qc_queued'); changed=True
+                elif q['status']=='done': self._finish_qc(ep['id'],q.get('result') or {},q.get('seconds')); changed=True
                 elif q['status']=='failed':
-                    self.db.patch('episode',ep['id'],status='captured',error='QC 실패: '+str(q.get('error','')))
+                    self.db.patch('episode',ep['id'],status='captured',error='QC 실패: '+str(q.get('error',''))); changed=True
+        return changed
     def _finish_qc(self,key,result,seconds):
         result=clean(result); save_json(self.root/'episodes'/key/'qc.json',result)
         self.db.patch('episode',key,status='qc_done',qc=result,qc_seconds=seconds,error=None)
@@ -329,9 +345,9 @@ class Capture:
     def wait_not_recording(self):
         while self.busy=='recording': time.sleep(0.2)
     # ── 저장 공간 ──
-    def disk(self):
+    def disk(self,eps=None):
         u=shutil.disk_usage(self.root)
-        pending=[e for e in self.db.all('episode') if not e.get('local_deleted') and e.get('status') not in ('deleted',)]
+        pending=[e for e in (self.db.all('episode') if eps is None else eps) if not e.get('local_deleted') and e.get('status') not in ('deleted',)]
         sizes=[e['bytes'] for e in pending if e.get('bytes')]
         # 최근 에피소드 평균, 없으면 640×480 에서 약 400MB 를 해상도 비율로 (848×480 이면 약 530MB)
         per=int(sum(sizes[:10])/len(sizes[:10])) if sizes else int(400*1024**2*self.cfg['capture_width']*self.cfg['capture_height']/(640*480))
@@ -341,21 +357,23 @@ class Capture:
     def _folder_bytes(self,p):
         return sum(f.stat().st_size for f in Path(p).rglob('*') if f.is_file())
     # ── NAS 저장이 끝난 원본 지우기 (체크섬 검증 완료만) ──
-    def reconcile(self,jobs):
-        by_id={j['id']:j for j in jobs}
-        for ep in self.db.all('episode'):
+    def reconcile(self,jobs,eps=None):
+        """에피소드를 바꿨으면 True. eps: 이미 읽어 둔 에피소드 목록."""
+        by_id={j['id']:j for j in jobs}; changed=False
+        for ep in (self.db.all('episode') if eps is None else eps):
             j=by_id.get(ep.get('export_job') or '')
             if not j or ep.get('local_deleted') or ep['id'] in self.transferring: continue
             if j.get('status')=='done' and ep.get('transfer_status')!='done':
-                self.db.patch('episode',ep['id'],transfer_status='done',nas_output=j.get('output'))
+                self.db.patch('episode',ep['id'],transfer_status='done',nas_output=j.get('output')); changed=True
                 self.db.log(ep['id'],'NAS 저장 · 체크섬 검증 완료: '+str(j.get('output','')))
             # 원본 형식(PhysicalAI rgbd_raw 그대로)으로 저장된 것만 지운다. 옛 PNG 변환 · 작업 폴더 형식 저장은 원본을 남긴다 (files 기록이 없는 작업)
             if j.get('status')=='done' and self.cfg.get('delete_after_nas',True) and j.get('files'):
                 shutil.rmtree(self.root/'episodes'/ep['id'],ignore_errors=True)
                 (self.root/'bundles'/(ep['id']+'.zip')).unlink(missing_ok=True)
                 if not (self.root/'episodes'/ep['id']).exists():
-                    self.db.patch('episode',ep['id'],local_deleted=True,local_deleted_at=now())
+                    self.db.patch('episode',ep['id'],local_deleted=True,local_deleted_at=now()); changed=True
                     self.db.log(ep['id'],'촬영 PC 원본 삭제 (NAS 저장 확인됨)')
+        return changed
     def delete_episode(self,key):
         """보내지 않을 에피소드 삭제 (QC FAIL 재촬영 등). 전송을 시작한 원본은 지울 수 없다."""
         with self.lock:

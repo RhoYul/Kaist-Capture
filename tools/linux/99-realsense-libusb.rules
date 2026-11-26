@@ -1,0 +1,8 @@
+# Intel RealSense (USB vendor 8086) — 일반 계정이 카메라를 열 수 있게 한다 (pip 의 pyrealsense2 는 libusb 로 직접 연다).
+# setup-capture.sh 가 /etc/udev/rules.d/ 에 복사한다. 복사 뒤 카메라 USB 를 다시 꽂거나 재부팅.
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="8086", MODE:="0666", GROUP:="plugdev"
+KERNEL=="video*", ATTRS{idVendor}=="8086", MODE:="0666", GROUP:="plugdev"
+KERNEL=="hidraw*", ATTRS{idVendor}=="8086", MODE:="0666", GROUP:="plugdev"
+SUBSYSTEM=="iio", ATTRS{idVendor}=="8086", MODE:="0666", GROUP:="plugdev"
+# 4대 동시 스트림은 USB 장치에 오래 쓰는 전원 절약(autosuspend)을 끄는 편이 안정적이다
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="8086", TEST=="power/control", ATTR{power/control}="on"

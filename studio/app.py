@@ -35,18 +35,9 @@ class Calib(BaseModel):
 class Review(BaseModel):
     note: str=Field(default='',max_length=2000)
 
-def slim_episode(ep):
-    """상태 목록용 에피소드: 캘리브레이션 사본은 빼고, 원본이 지워진(NAS 완료) 촬영은 QC 를 요약만 남긴다.
-    전체 QC 는 검수 창이 GET /api/episodes/{id} 로 따로 받는다 (qc.slim 표시)."""
-    e={k:v for k,v in ep.items() if k!='calibration'}
-    qc=e.get('qc')
-    if e.get('local_deleted') and isinstance(qc,dict):
-        e['qc']=dict(overall=qc.get('overall'),ok=qc.get('ok'),frame_count=qc.get('frame_count'),slim=True)
-    return e
-
 
 def create_app(cfg):
-    db=Store(cfg['data_dir']); sessions={}; attempts={}; remote_cache={}
+    db=Store(cfg['data_dir']); sessions={}; attempts={}
     # 쿠키는 포트를 구분하지 않는다 → 같은 PC의 촬영 PC(8765)·export(8766)가 서로 로그인을 덮어쓰지 않게 이름을 나눈다
     COOKIE='studio_session_'+str(cfg['port'])
     capture=Capture(cfg,db) if cfg['role']=='capture' else None
@@ -55,19 +46,21 @@ def create_app(cfg):
     VERSION=update.version(install_root)   # 지금 돌고 있는 코드 버전 (관제 화면 · 업데이트 확인용)
     @asynccontextmanager
     async def lifespan(app):
+        def report():
+            eps=db.all('episode',drop=('calibration',))   # 에피소드는 한 번만 읽어 같이 쓴다 (기록이 많으면 읽기 · JSON 풀기가 비싸다)
+            cams=capture.cameras() if cfg['demo'] else (capture.preview.list_cameras() if capture.preview else [])
+            summary=[{k:e.get(k) for k in ('id','task_id','task_name','status','transfer_status','local_deleted','updated_at')} for e in eps[:20]]
+            remote('POST','/api/machine/heartbeat',json=dict(station=cfg['station'],busy=capture.busy,cameras=cams,episodes=summary,
+                                                             logs=db.logs()[:100],disk=capture.disk(eps)))
+            data=remote('GET','/api/machine/state')
+            changed=capture.reconcile_qc(data.get('qc',[]),eps)   # export 서버 QC 결과 반영 · PASS 는 자동 전송
+            capture.reconcile(data['jobs'],None if changed else eps)   # NAS 저장이 끝난 원본 정리
         async def heartbeat_loop():
             last_error=None
             while True:
                 try:
-                    cams=capture.cameras() if cfg['demo'] else (capture.preview.list_cameras() if capture.preview else [])
-                    summary=[{k:e.get(k) for k in ('id','task_id','task_name','status','transfer_status','local_deleted','updated_at')} for e in db.all('episode')[:20]]
-                    await asyncio.to_thread(remote,'POST','/api/machine/heartbeat',json=dict(station=cfg['station'],busy=capture.busy,cameras=cams,episodes=summary,
-                                                                                         logs=db.logs()[:100],disk=capture.disk()))
-                    data=await asyncio.to_thread(remote,'GET','/api/machine/state')
-                    await asyncio.to_thread(capture.reconcile_qc,data.get('qc',[]))   # export 서버 QC 결과 반영 · PASS 는 자동 전송
-                    await asyncio.to_thread(capture.reconcile,data['jobs'])   # NAS 저장이 끝난 원본 정리
-                    for t in data.get('tasks',[]): db.put('task',t['id'],t)
-                    remote_cache.update(data=data,at=time.time())   # 화면 상태 요청은 이 결과를 재사용
+                    # DB 읽기 · 디스크 계산까지 모두 작업 스레드에서 (이벤트 루프에서 하면 그동안 미리보기 스트림이 멈춘다)
+                    await asyncio.to_thread(report)
                     if last_error:
                         db.log('export','export 서버 연결 복구 ('+cfg['export_url']+')'); print('[heartbeat] 복구',file=sys.stderr,flush=True); last_error=None
                 except Exception as e:
@@ -150,44 +143,34 @@ def create_app(cfg):
     @app.get('/api/state')
     def state(role=Depends(auth)):
         tasks=db.all('task'); jobs=db.all('job') if exporter else []; server_error=None
+        # 2초마다 불린다 — 에피소드는 한 번 읽어 아래에서 같이 쓴다 (바뀐 게 있을 때만 다시 읽음).
+        # 에피소드마다 복사된 캘리브레이션(약 2.7KB)은 화면 · 정리 코드가 쓰지 않으므로 빼고 읽는다 (DB · episode.json 에는 그대로)
+        eps=db.all('episode',drop=('calibration',))
         if capture:
-            # 하트비트(5초마다)가 export 서버 상태를 받아 반영해 둔다 → 화면은 2초마다 묻지만 최근 결과가 있으면 그대로 쓴다
-            cached=remote_cache.get('data')
-            if cached and time.time()-remote_cache.get('at',0)<8:
-                tasks=cached['tasks'];jobs=cached['jobs']
-            else:
-                try:
-                    data=remote('GET','/api/machine/state');tasks=data['tasks'];jobs=data['jobs']
-                    for t in tasks: db.put('task',t['id'],t)
-                    capture.reconcile_qc(data.get('qc',[]))
-                    capture.reconcile(jobs)
-                    remote_cache.update(data=data,at=time.time())
-                except Exception: server_error='export 서버 연결 안 됨 · 마지막 작업 목록 사용 중'
+            try:
+                data=remote('GET','/api/machine/state')
+                same=lambda a,b:{k:v for k,v in a.items() if k!='updated_at'}=={k:v for k,v in b.items() if k!='updated_at'}
+                known={t['id']:t for t in tasks};tasks=data['tasks'];jobs=data['jobs']
+                for t in tasks:
+                    if t['id'] not in known or not same(known[t['id']],t): db.put('task',t['id'],t)   # 바뀐 작업만 쓴다
+                changed=capture.reconcile_qc(data.get('qc',[]),eps)
+                changed=capture.reconcile(jobs,None if changed else eps) or changed
+                if changed: eps=db.all('episode',drop=('calibration',))
+            except Exception: server_error='export 서버 연결 안 됨 · 마지막 작업 목록 사용 중'
         cams=capture.cameras() if capture else []
         cal=db.get('calibration','current')
-        # 에피소드가 수백 개 쌓이면 매번 통째로 보내는 응답(캘리브레이션 사본 · QC 상세 포함)이 수 MB 가 되고
-        # 만드는 데 1~2초씩 CPU 를 잡아 카메라 수신까지 방해한다 → DB 는 한 번만 읽고, 목록에 필요 없는 큰 값은 뺀다
-        episodes=db.all('episode')
-        pend=[e for e in episodes if e.get('status') in capture.PENDING and not e.get('export_job') and not e.get('local_deleted')] if capture else []
-        episodes=[slim_episode(e) for e in episodes]
-        body=dict(resolution=capture.resolution() if capture else None,capture_fps=int(cfg['capture_fps']) if capture else None,
+        pend=capture.pending_episodes(eps) if capture else []
+        # JSONResponse 로 바로 보낸다 — FastAPI 기본 변환(jsonable_encoder)은 에피소드가 많으면 수백 ms 걸린다 (값은 모두 DB 에서 읽은 JSON)
+        return JSONResponse(dict(resolution=capture.resolution() if capture else None,
                     pending=dict(total=len(pend),limit=int(cfg.get('max_pending',10)),need_qc=sum(e['status']=='captured' for e in pend),
                                  in_qc=sum(e['status'] in ('qc_queued','qc_running') for e in pend),review=sum(e['status']=='qc_done' for e in pend),
                                  auto_export=bool(cfg.get('auto_export',True)),qc_on_export=capture.qc_remote()) if capture else None,
                     calibration_mismatch=capture.calibration_mismatch(cal) if capture and cal else None,role=cfg['role'],user_role=role,station=cfg['station'],demo=cfg['demo'],tasks=tasks,jobs=jobs,
-                    episodes=episodes,cameras=cams,calibration=cal,
+                    episodes=eps,cameras=cams,calibration=db.get('calibration','current'),
                     captures=len(capture.calib_sets) if capture else 0,busy=capture.busy if capture else None,
                     durations=list(capture.DURATIONS) if capture else [],live=capture.live_status() if capture else None,
-                    logs=db.logs() if role=='admin' else [],server_error=server_error,disk=capture.disk() if capture else None,
-                    nas_configured=bool(cfg['nas_root']) if exporter else None,stations=db.all('station') if exporter else [])
-        # DB 에서 읽은 순수 JSON 이라 FastAPI 의 느린 변환(jsonable_encoder)을 건너뛰고 바로 직렬화한다
-        return Response(json.dumps(body,ensure_ascii=False,allow_nan=False,default=str),media_type='application/json')
-    @app.get('/api/episodes/{key}',dependencies=[Depends(auth)])
-    def episode_detail(key:str):
-        """검수 창용 전체 기록 (상태 목록에서 뺀 QC 상세 포함)."""
-        ep=db.get('episode',safe_id(key))
-        if not ep: raise HTTPException(404,'에피소드가 없습니다')
-        ep.pop('calibration',None); return ep
+                    logs=db.logs() if role=='admin' else [],server_error=server_error,disk=capture.disk(eps) if capture else None,
+                    nas_configured=bool(cfg['nas_root']) if exporter else None,stations=db.all('station') if exporter else []))
     @app.post('/api/machine/heartbeat',dependencies=[Depends(machine)])
     async def heartbeat(request:Request):
         b=await request.json();station=safe_id(b['station'])
@@ -327,6 +310,24 @@ def create_app(cfg):
                     yield b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '+str(len(data)).encode()+b'\r\n\r\n'+data+b'\r\n'
                 await asyncio.sleep(1/30)  # 카메라 15fps를 놓치지 않게 두 배로 확인. 같은 프레임은 다시 보내지 않는다
         return StreamingResponse(frames(),media_type='multipart/x-mixed-replace; boundary=frame')
+    @app.get('/api/preview/stream',dependencies=[Depends(auth)])
+    async def preview_stream(request:Request):
+        """카메라 4대 미리보기를 연결 하나로 (화면이 칸마다 나눠 그린다).
+        카메라별 스트림 4개는 브라우저의 같은 주소 동시 연결 한도(6개) 중 4개를 계속 차지해 다른 요청이 줄을 섰다.
+        파트마다 X-Camera 헤더로 어느 카메라인지 표시한다. 카메라 서비스가 이미 만든 JPEG 를 그대로 보내므로 USB·촬영 경로에는 영향이 없다."""
+        need_capture()
+        token=request.cookies.get(COOKIE)
+        async def frames():
+            last={}
+            while not await request.is_disconnected():
+                s=sessions.get(token)
+                if not s or s['expires']<time.time(): break
+                for cam,data in (await asyncio.to_thread(capture.preview_frames)).items():   # 한 번에 4대 (스레드 왕복 1번)
+                    if data and data is not last.get(cam):
+                        last[cam]=data
+                        yield (b'--frame\r\nContent-Type: image/jpeg\r\nX-Camera: '+cam.encode()+b'\r\nContent-Length: '+str(len(data)).encode()+b'\r\n\r\n'+data+b'\r\n')
+                await asyncio.sleep(1/30)  # 카메라 15fps를 놓치지 않게 두 배로 확인. 같은 프레임은 다시 보내지 않는다
+        return StreamingResponse(frames(),media_type='multipart/mixed; boundary=frame',headers={'Cache-Control':'no-store','X-Accel-Buffering':'no'})
     @app.post('/api/calibration/snapshot',dependencies=[Depends(auth)])
     def snapshot(): need_capture();return dict(count=capture.snapshot())
     @app.post('/api/calibration/reset',dependencies=[Depends(auth)])

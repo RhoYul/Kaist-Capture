@@ -50,8 +50,10 @@ class Store:
     def patch(self, kind, key, **changes):
         with self.lock:
             return self.put(kind,key,dict(self.get(kind,key) or {},**changes))
-    def all(self, kind):
-        with self.connect() as c: rows=c.execute('SELECT body FROM records WHERE kind=? ORDER BY rowid DESC',(kind,)).fetchall()
+    def all(self, kind, drop=()):
+        """drop: 빼고 읽을 최상위 키 (예: 에피소드마다 복사된 calibration). SQLite 가 빼고 주므로 읽기 · JSON 풀기가 빨라진다."""
+        col='json_remove(body,'+','.join('?'*len(drop))+')' if drop else 'body'
+        with self.connect() as c: rows=c.execute('SELECT '+col+' FROM records WHERE kind=? ORDER BY rowid DESC',(*('$.'+k for k in drop),kind)).fetchall()
         return [json.loads(r[0]) for r in rows]
     def log(self, entity, message, level='info', episode=None, station=None):
         if episode is None and str(entity).startswith('ep_'): episode=entity   # 에피소드 로그는 entity 가 에피소드 ID

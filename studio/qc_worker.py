@@ -3,7 +3,7 @@
     python -m studio.qc_worker <에피소드 폴더> <장면 1D|2D|3D> <결과 json 경로>
 
 PhysicalAI 원본 QC(vendor/capture_qc.py) · 장면별 기준(presets.py)을 그대로 부른다. 결과만 JSON 으로 쓴다.
-별도 프로세스라 녹화가 시작되면 export 서버가 바로 일시정지할 수 있고, 끝나면 멈춘 곳부터 이어 돌린다.
+별도 프로세스라 녹화가 시작되면 export 서버가 바로 멈출(종료할) 수 있고, 끝나면 처음부터 다시 돌린다.
 """
 from __future__ import annotations
 import json, math, sys
