@@ -48,6 +48,8 @@ class Capture:
                     from .warm import WarmCameraService, configure   # 녹화 설정으로 상시 열린 카메라 (미리보기 · 캘리브레이션 · 녹화 공용)
                     configure(self.cfg['capture_width'],self.cfg['capture_height'],self.cfg['capture_fps'])
                     warm.SDK_QUEUE=int(self.cfg.get('sdk_queue',32))   # 카메라 SDK 안의 프레임 버퍼 (0 = 예전 방식)
+                    warm.WHITE_BALANCE=self.cfg.get('white_balance','lock')   # "lock" · 숫자(K) · "auto"
+                    warm.AE_PRIORITY=bool(self.cfg.get('auto_exposure_priority',False))   # False = 노출 우선 끔 (fps 고정)
                     self.preview=WarmCameraService.get()
                 self._preview_thread=threading.Thread(target=open_cameras,daemon=True,name='warm-open'); self._preview_thread.start()
                 self._preview_thread.join(15)   # 정상이면 몇 초 안에 끝난다

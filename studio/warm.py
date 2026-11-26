@@ -36,10 +36,64 @@ JPEG_QUALITY = 80          # 원본 미리보기와 같은 품질 (캘리브레�
 # (화면 응답 · 정렬 · 저장이 같은 프로세스에서 돌아 순서를 기다리는 동안) 그 사이 프레임을 SDK 가 버린다 → '받지 못한 프레임'.
 # SDK 가 자기 스레드로 이 버퍼에 쌓아 두면 파이썬이 잠깐 늦어도 버려지지 않는다. 0 이면 예전 방식 (capture.json 의 sdk_queue)
 SDK_QUEUE = 32
+# RGB 화이트밸런스 (capture.json 의 white_balance).
+#   "lock" = 카메라를 연 뒤 자동 화이트밸런스가 자리 잡으면(WB_SETTLE_S 초) 4대 값의 가운데 값으로 4대를 같이 고정 (기본)
+#   숫자   = 그 색온도(K)로 4대 고정 (예: 4600) · "auto" = 예전처럼 카메라마다 자동
+# 자동이면 카메라마다 · 장면마다(작업자 · 큰 물체) 색이 따로 바뀐다 → 4대 색이 맞지 않고 에피소드마다 색이 달라진다.
+WHITE_BALANCE = "lock"
+WB_SETTLE_S = 3.0
+_wb_locked: Optional[int] = None   # "lock" 으로 정해진 값 (다시 열린 카메라에도 같은 값)
+# RGB 노출 우선 (capture.json 의 auto_exposure_priority). 켜져 있으면 어두울 때 카메라가 노출 시간을 늘리려고
+# 스스로 fps 를 낮춘다 (진단 실측: 끊김 없이 10초 290장 = 약 29fps). False = 끔 → 항상 설정 fps (기본)
+AE_PRIORITY = False
 
 
 def _rs():
     return rv._rs()
+
+
+def _wb_target() -> Optional[int]:
+    """지금 적용할 화이트밸런스 고정 값 (K). 자동이면 None."""
+    wb = WHITE_BALANCE
+    if isinstance(wb, (int, float)) and not isinstance(wb, bool):
+        return int(wb)
+    if isinstance(wb, str) and wb.strip().isdigit():
+        return int(wb.strip())
+    return _wb_locked if wb == "lock" else None
+
+
+def _set_wb(rs, sensor, kelvin: int) -> int:
+    """자동 화이트밸런스를 끄고 kelvin 으로 고정 (장치 범위 · 단위에 맞춘 값을 돌려준다)."""
+    r = sensor.get_option_range(rs.option.white_balance)
+    step = r.step or 1
+    v = min(r.max, max(r.min, round((kelvin - r.min) / step) * step + r.min))
+    sensor.set_option(rs.option.enable_auto_white_balance, 0)
+    sensor.set_option(rs.option.white_balance, v)
+    return int(v)
+
+
+def _apply_color_options(rs, sensor, camera_id: str) -> str:
+    """RGB 센서 설정: 노출 우선 · 화이트밸런스. 장치가 지원하지 않거나 실패해도 스트림은 그대로 (로그용 요약을 돌려준다)."""
+    notes = []
+    if sensor is None:
+        return "RGB 센서 없음"
+    try:
+        if sensor.supports(rs.option.auto_exposure_priority):
+            sensor.set_option(rs.option.auto_exposure_priority, 1 if AE_PRIORITY else 0)
+            notes.append("노출 우선 " + ("켬" if AE_PRIORITY else "끔"))
+    except Exception as e:
+        logger.warning(f"[warm] {camera_id} 노출 우선 설정 실패 (그대로 계속): {e}")
+    try:
+        if sensor.supports(rs.option.white_balance) and sensor.supports(rs.option.enable_auto_white_balance):
+            target = _wb_target()
+            if target:
+                notes.append(f"화이트밸런스 {_set_wb(rs, sensor, target)}K 고정")
+            else:
+                sensor.set_option(rs.option.enable_auto_white_balance, 1)
+                notes.append("화이트밸런스 자동" + (" (고정 대기)" if WHITE_BALANCE == "lock" else ""))
+    except Exception as e:
+        logger.warning(f"[warm] {camera_id} 화이트밸런스 설정 실패 (그대로 계속): {e}")
+    return " · ".join(notes)
 
 
 _TOA = None
@@ -360,6 +414,7 @@ class WarmCamera:
         self._fq = None               # SDK 프레임 버퍼 (rs.frame_queue) — 없으면 예전 방식
         self._classic = False         # SDK 버퍼 방식이 안 되는 장치 · SDK → 예전 방식으로만 연다
         self._loose = 0
+        self._color_sensor = None     # RGB 센서 (노출 우선 · 화이트밸런스 설정용)
 
     # ── 열기 · 루프 ──
     def open(self):
@@ -384,8 +439,12 @@ class WarmCamera:
         self._factory = {"K": np.array([[ci.fx, 0, ci.ppx], [0, ci.fy, ci.ppy], [0, 0, 1]], dtype=np.float64),
                          "dist": np.array(ci.coeffs, dtype=np.float64), "size": (ci.width, ci.height)}
         self.last_error = ""
+        try: self._color_sensor = profile.get_device().first_color_sensor()
+        except Exception: self._color_sensor = None
+        color_notes = _apply_color_options(rs, self._color_sensor, self.camera_id)   # 다시 열 때도 같은 설정
         logger.warning(f"[warm] {self.camera_id} ({self.serial}) 열림 {ci.width}x{ci.height}@{rv.COLOR_FPS} · "
-                       + (f"SDK 버퍼 {SDK_QUEUE}장" if self._fq is not None else "SDK 버퍼 없음 (예전 방식)"))
+                       + (f"SDK 버퍼 {SDK_QUEUE}장" if self._fq is not None else "SDK 버퍼 없음 (예전 방식)")
+                       + (" · " + color_notes if color_notes else ""))
         return pipeline, align
 
     def _start(self, rs, pipeline, config):
@@ -557,6 +616,43 @@ class WarmCameraService:
         self._cameras = cams
         logger.warning(f"[warm] 카메라 {len(cams)}대 ({rv.COLOR_W}x{rv.COLOR_H}@{rv.COLOR_FPS}): "
                        + ", ".join(f"{c.serial} USB {c.usb or '?'}" for c in cams.values()))
+        if WHITE_BALANCE == "lock" and _wb_locked is None and cams:
+            threading.Thread(target=self._lock_white_balance, daemon=True, name="warm-wb").start()
+
+    def _lock_white_balance(self) -> None:
+        """자동 화이트밸런스가 자리 잡은 뒤 4대 값의 가운데 값으로 4대를 같이 고정한다 (서버를 켤 때 한 번)."""
+        global _wb_locked
+        time.sleep(WB_SETTLE_S)
+        try:
+            rs = _rs()
+            cams = [c for c in self._cameras.values() if c._color_sensor is not None]
+            values, default = {}, None
+            for c in cams:
+                try:
+                    s = c._color_sensor
+                    if not s.supports(rs.option.white_balance):
+                        continue
+                    values[c.camera_id] = float(s.get_option(rs.option.white_balance))
+                    default = s.get_option_range(rs.option.white_balance).default
+                except Exception as e:
+                    logger.warning(f"[warm] {c.camera_id} 화이트밸런스 읽기 실패: {e}")
+            if not values:
+                logger.warning("[warm] 화이트밸런스 고정 못 함 — 읽을 수 있는 RGB 센서가 없음 (자동으로 계속)")
+                return
+            v = sorted(values.values())
+            median = v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2
+            _wb_locked = int(round(median))
+            applied = {}
+            for c in cams:
+                try: applied[c.camera_id] = _set_wb(rs, c._color_sensor, _wb_locked)
+                except Exception as e: logger.warning(f"[warm] {c.camera_id} 화이트밸런스 고정 실패: {e}")
+            same_as_default = default is not None and all(abs(x - default) < 1 for x in values.values())
+            logger.warning("[warm] 화이트밸런스 고정 " + str(_wb_locked) + "K (자동 값: "
+                           + ", ".join(f"{k} {int(x)}K" for k, x in values.items()) + ")"
+                           + (" — 4대 모두 장치 기본값이라 자동 값을 못 읽었을 수 있음. capture.json 에 white_balance 숫자를 넣으세요"
+                              if same_as_default else ""))
+        except Exception:
+            logger.exception("[warm] 화이트밸런스 고정 실패 (자동으로 계속)")
 
     def _watch_loop(self) -> None:
         while True:

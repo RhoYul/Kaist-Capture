@@ -86,6 +86,10 @@ DEFAULTS = dict(role='capture', host='127.0.0.1', port=8765, data_dir='./data', 
                 capture_width=848, capture_height=480, capture_fps=30,
                 # 카메라 SDK 안의 프레임 버퍼 (장). 촬영 서버가 잠깐 바빠 프레임을 늦게 꺼내도 버려지지 않게 한다. 0 = 예전 방식 (버퍼 1장)
                 sdk_queue=32,
+                # RGB 화이트밸런스: "lock" = 켤 때 자동 값이 자리 잡으면 4대 가운데 값으로 같이 고정 · 숫자 = 그 색온도(K)로 고정 · "auto" = 카메라마다 자동
+                white_balance='lock',
+                # RGB 노출 우선: False = 끔 (어두워도 fps 를 낮추지 않는다) · True = 카메라 기본 (어두우면 fps 가 떨어질 수 있음)
+                auto_exposure_priority=False,
                 # 연속 촬영: QC 를 안 했거나 검수를 기다리는 에피소드가 이만큼 쌓이면 촬영을 막는다 (QC 일괄 실행 · 검수 후 계속)
                 max_pending=10,
                 # QC 전체 PASS 에피소드는 자동 승인 · NAS 전송. WARN · FAIL 이 하나라도 있으면 작업자 검수를 기다린다
