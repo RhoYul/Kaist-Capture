@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import FileResponse, Response, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from .core import Store, safe_id, uid, now
+from .core import Store, safe_id, uid, now, overlap, newest
 from .capture import Capture
 from .exporter import Exporter, nas_candidates, resolve_nas_cached
 from .vendor.calibration import ExtrinsicCalibrationError
@@ -44,16 +44,38 @@ def create_app(cfg):
     exporter=Exporter(cfg,db) if cfg['role']=='export' else None
     install_root=Path(cfg.get('install_root') or update.ROOT)
     VERSION=update.version(install_root)   # 지금 돌고 있는 코드 버전 (관제 화면 · 업데이트 확인용)
+    # 이 서버가 켜진 뒤로만 통하는 표식. 화면 · 촬영 서버는 목록(에피소드 · NAS 작업 · QC)을 한 번만 전체로 받고 그 뒤로는
+    # '그 뒤에 바뀐 것만' 받아 합친다 — 서버가 다시 켜져 표식이 달라지면 전체를 다시 받는다.
+    BOOT=uid('boot_')
+    # export 서버의 작업 · QC 목록 사본 (촬영 서버가 들고 있는다). 상태 화면(2초) · 하트비트(5초)가 같이 쓴다
+    rlock=threading.RLock(); rcache=dict(epoch=None,cursor=None,jobs={},qc={},tasks=[])
+    def remote_snapshot():
+        """지금 들고 있는 사본 (export 서버에 묻지 않는다). 최근에 바뀐 것부터."""
+        with rlock:
+            recent=lambda d:sorted(d.values(),key=lambda x:str(x.get('updated_at') or ''),reverse=True)
+            return dict(tasks=list(rcache['tasks']),jobs=recent(rcache['jobs']),qc=recent(rcache['qc']),epoch=rcache['epoch'] or '')
+    def remote_state():
+        """export 서버의 작업(Task) · NAS 작업 · QC 목록. 처음 한 번만 전체를 받고 그 뒤로는 바뀐 것만 받아 사본에 합친다.
+        (기록이 수천 건이면 전체는 1MB 를 넘고, export 서버가 읽어 묶는 데만 1초 가까이 걸렸다 — 화면이 2초마다 그걸 기다렸다.)
+        export 서버가 다시 켜졌거나 (epoch 가 달라짐) 예전 코드라 표식을 주지 않으면 전체를 받는다."""
+        with rlock:
+            params=dict(since=rcache['cursor'],epoch=rcache['epoch']) if rcache['epoch'] and rcache['cursor'] else None
+            data=remote('GET','/api/machine/state',params=params)
+            if data.get('full',True) or data.get('epoch')!=rcache['epoch']: rcache['jobs']={}; rcache['qc']={}
+            for j in data['jobs']: rcache['jobs'][j['id']]=j
+            for q in data.get('qc',[]): rcache['qc'][q.get('id')]=q
+            rcache.update(epoch=data.get('epoch'),cursor=data.get('cursor'),tasks=data['tasks'])
+            return remote_snapshot()
     @asynccontextmanager
     async def lifespan(app):
         def report():
-            eps=db.all('episode',drop=('calibration',))   # 에피소드는 한 번만 읽어 같이 쓴다 (기록이 많으면 읽기 · JSON 풀기가 비싸다)
+            eps=capture.active_episodes()   # 이 PC 에 원본이 남은 에피소드만 (기록 전체를 읽어 풀면 수백 ms)
             cams=capture.cameras() if cfg['demo'] else (capture.preview.list_cameras() if capture.preview else [])
-            summary=[{k:e.get(k) for k in ('id','task_id','task_name','status','transfer_status','local_deleted','updated_at')} for e in eps[:20]]
+            summary=[{k:e.get(k) for k in ('id','task_id','task_name','status','transfer_status','local_deleted','updated_at')} for e in db.all('episode',drop=('calibration',),limit=20)]
             remote('POST','/api/machine/heartbeat',json=dict(station=cfg['station'],busy=capture.busy,cameras=cams,episodes=summary,
                                                              logs=db.logs()[:100],disk=capture.disk(eps)))
-            data=remote('GET','/api/machine/state')
-            changed=capture.reconcile_qc(data.get('qc',[]),eps)   # export 서버 QC 결과 반영 · PASS 는 자동 전송
+            data=remote_state()
+            changed=capture.reconcile_qc(data['qc'],eps)   # export 서버 QC 결과 반영 · PASS 는 자동 전송
             capture.reconcile(data['jobs'],None if changed else eps)   # NAS 저장이 끝난 원본 정리
         async def heartbeat_loop():
             last_error=None
@@ -141,32 +163,45 @@ def create_app(cfg):
         with httpx.Client(base_url=cfg['export_url'],headers={'Authorization':'Bearer '+cfg['transfer_token']},timeout=4,trust_env=False) as c:
             r=c.request(method,url,**kwargs);r.raise_for_status();return r.json()
     @app.get('/api/state')
-    def state(role=Depends(auth)):
-        tasks=db.all('task'); jobs=db.all('job') if exporter else []; server_error=None
-        # 2초마다 불린다 — 에피소드는 한 번 읽어 아래에서 같이 쓴다 (바뀐 게 있을 때만 다시 읽음).
-        # 에피소드마다 복사된 캘리브레이션(약 2.7KB)은 화면 · 정리 코드가 쓰지 않으므로 빼고 읽는다 (DB · episode.json 에는 그대로)
-        eps=db.all('episode',drop=('calibration',))
+    def state(role=Depends(auth),since:str|None=None,jsince:str|None=None,epoch:str|None=None):
+        """화면이 2초마다 묻는다. 에피소드 · NAS 작업 목록은 처음(또는 서버가 다시 켜진 뒤) 한 번만 전체를 주고,
+        그 뒤로는 화면이 돌려준 커서(since · jsince) 뒤에 바뀐 것만 준다 (episodes_full · jobs_full 이 False). 화면이 받아 합친다.
+        (예전에는 매번 전체 — 에피소드 1,800건이면 6MB 를 2초마다 읽고 · 묶고 · 보내고 · 풀었다.)"""
+        tasks=db.all('task'); server_error=None; all_jobs=None; repoch=''
+        # 서버 쪽 집계 · 정리는 이 PC 에 원본이 남은 에피소드만 본다 (NAS 로 보내고 지운 기록은 볼 일이 없다)
+        eps=capture.active_episodes() if capture else []
         if capture:
             try:
-                data=remote('GET','/api/machine/state')
+                data=remote_state()
                 same=lambda a,b:{k:v for k,v in a.items() if k!='updated_at'}=={k:v for k,v in b.items() if k!='updated_at'}
-                known={t['id']:t for t in tasks};tasks=data['tasks'];jobs=data['jobs']
+                known={t['id']:t for t in tasks};tasks=data['tasks'];all_jobs=data['jobs'];repoch=data['epoch']
                 for t in tasks:
                     if t['id'] not in known or not same(known[t['id']],t): db.put('task',t['id'],t)   # 바뀐 작업만 쓴다
-                changed=capture.reconcile_qc(data.get('qc',[]),eps)
-                changed=capture.reconcile(jobs,None if changed else eps) or changed
-                if changed: eps=db.all('episode',drop=('calibration',))
-            except Exception: server_error='export 서버 연결 안 됨 · 마지막 작업 목록 사용 중'
+                changed=capture.reconcile_qc(data['qc'],eps)
+                changed=capture.reconcile(all_jobs,None if changed else eps) or changed
+                if changed: eps=capture.active_episodes()
+            except Exception:
+                server_error='export 서버 연결 안 됨 · 마지막 작업 목록 사용 중'
+                snap=remote_snapshot(); all_jobs=snap['jobs']; repoch=snap['epoch']
+        # 화면에 줄 목록: 커서가 이 서버(와 export 서버)의 것이면 그 뒤에 바뀐 것만, 아니면 전체
+        my_epoch=BOOT+'|'+repoch; delta=bool(epoch) and epoch==my_epoch
+        es=overlap(since) if delta and since else None; js=overlap(jsince) if delta and jsince else None
+        out_eps=db.all('episode',drop=('calibration',),since=es)   # 위 정리에서 바뀐 것까지 들어가게 마지막에 읽는다
+        if capture: out_jobs=all_jobs if js is None else [j for j in all_jobs if str(j.get('updated_at') or '')>js]
+        else: out_jobs=db.all('job',since=js) if exporter else []
         cams=capture.cameras() if capture else []
         cal=db.get('calibration','current')
         pend=capture.pending_episodes(eps) if capture else []
         # JSONResponse 로 바로 보낸다 — FastAPI 기본 변환(jsonable_encoder)은 에피소드가 많으면 수백 ms 걸린다 (값은 모두 DB 에서 읽은 JSON)
-        return JSONResponse(dict(resolution=capture.resolution() if capture else None,
+        jobs=out_jobs
+        return JSONResponse(dict(epoch=my_epoch,episodes_full=es is None,jobs_full=js is None,
+                    cursor=newest(out_eps,since if es else None),jcursor=newest(out_jobs,jsince if js else None),
+                    resolution=capture.resolution() if capture else None,
                     pending=dict(total=len(pend),limit=int(cfg.get('max_pending',10)),need_qc=sum(e['status']=='captured' for e in pend),
                                  in_qc=sum(e['status'] in ('qc_queued','qc_running') for e in pend),review=sum(e['status']=='qc_done' for e in pend),
                                  auto_export=bool(cfg.get('auto_export',True)),qc_on_export=capture.qc_remote()) if capture else None,
                     calibration_mismatch=capture.calibration_mismatch(cal) if capture and cal else None,role=cfg['role'],user_role=role,station=cfg['station'],demo=cfg['demo'],tasks=tasks,jobs=jobs,
-                    episodes=eps,cameras=cams,calibration=db.get('calibration','current'),
+                    episodes=out_eps,cameras=cams,calibration=cal,
                     captures=len(capture.calib_sets) if capture else 0,busy=capture.busy if capture else None,
                     durations=list(capture.DURATIONS) if capture else [],live=capture.live_status() if capture else None,
                     logs=db.logs() if role=='admin' else [],server_error=server_error,disk=capture.disk(eps) if capture else None,
@@ -263,7 +298,12 @@ def create_app(cfg):
         threading.Thread(target=bye,daemon=True).start()
         return dict(ok=True)
     @app.get('/api/machine/state',dependencies=[Depends(machine)])
-    def machine_state(): return dict(tasks=db.all('task'),jobs=db.all('job'),qc=db.all('qc')[:200])
+    def machine_state(since:str|None=None,epoch:str|None=None):
+        """촬영 서버가 묻는 작업(Task) · NAS 작업 · QC 목록. 지난 응답의 cursor · epoch 를 돌려주면 그 뒤에 바뀐 것만 준다 (full=False).
+        처음이거나 이 서버가 그사이 다시 켜졌으면 (epoch 가 다름) 전체 — 예전 촬영 서버 코드는 아무것도 주지 않으므로 늘 전체를 받는다."""
+        s=overlap(since) if since and epoch==BOOT else None
+        jobs=db.all('job',since=s); qc=db.all('qc',since=s) if s else db.all('qc',limit=200)
+        return dict(tasks=db.all('task'),jobs=jobs,qc=qc,full=s is None,epoch=BOOT,cursor=newest(jobs+qc,since if s else None))
     def create_task_record(body):
         if not exporter: raise HTTPException(409,'작업은 export 서버의 관리자 화면에서 생성하세요')
         if body.scene not in ('1D','2D','3D'): raise ValueError('장면 유형 오류')

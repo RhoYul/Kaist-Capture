@@ -259,10 +259,14 @@ class Capture:
     # 같은 PC export 서버가 있으면 QC 를 거기 대기열에 맡긴다 (촬영 서버는 촬영만 · 녹화하면 QC 가 잠깐 멈춤).
     # QC 전체 PASS 는 자동 승인 · NAS 전송, WARN · FAIL 이 하나라도 있으면 작업자 검수를 기다린다.
     PENDING=('captured','qc_queued','qc_running','qc_done')
+    def active_episodes(self):
+        """이 PC 에 원본이 남아 있는 에피소드 (NAS 저장이 끝나 지운 것 · 삭제한 것 제외, 캘리브레이션 사본은 빼고 읽는다).
+        대기 수 · QC 결과 반영 · 원본 정리 · 저장 공간 계산은 모두 이것만 보면 된다 — 기록 전체(수천 건)를 2초마다 읽어 풀지 않는다."""
+        return self.db.all('episode',drop=('calibration',),active=True)
     def pending_episodes(self,eps=None):
         """아직 NAS 로 보내지 않은 촬영 (QC 전 · QC 중 · 검수 대기). max_pending 개가 쌓이면 촬영을 막는다.
         eps: 이미 읽어 둔 에피소드 목록 (상태 화면이 한 번 읽어 같이 쓴다)."""
-        return [e for e in (self.db.all('episode') if eps is None else eps) if e.get('status') in self.PENDING and not e.get('export_job') and not e.get('local_deleted')]
+        return [e for e in (self.active_episodes() if eps is None else eps) if e.get('status') in self.PENDING and not e.get('export_job') and not e.get('local_deleted')]
     def qc_remote(self): return self.export_is_local()
     def qc(self,key):
         with self.lock:
@@ -292,7 +296,7 @@ class Capture:
         """export 서버의 QC 결과를 받아 반영한다 (상태 갱신 · 하트비트에서 부른다). 에피소드를 바꿨으면 True.
         eps: 이미 읽어 둔 에피소드 목록 (바꿀 때는 DB 에서 다시 읽어 확인한다)."""
         by_id={q.get('id'):q for q in qc_list or []}; changed=False
-        for ep in (self.db.all('episode') if eps is None else eps):
+        for ep in (self.active_episodes() if eps is None else eps):
             if ep.get('status') not in ('qc_queued','qc_running') or ep.get('local_deleted'): continue
             q=by_id.get(ep['id'])
             if not q:
@@ -366,7 +370,7 @@ class Capture:
     # ── 저장 공간 ──
     def disk(self,eps=None):
         u=shutil.disk_usage(self.root)
-        pending=[e for e in (self.db.all('episode') if eps is None else eps) if not e.get('local_deleted') and e.get('status') not in ('deleted',)]
+        pending=[e for e in (self.active_episodes() if eps is None else eps) if not e.get('local_deleted') and e.get('status') not in ('deleted',)]
         sizes=[e['bytes'] for e in pending if e.get('bytes')]
         # 최근 에피소드 평균, 없으면 640×480 에서 약 400MB 를 해상도 비율로 (848×480 이면 약 530MB)
         per=int(sum(sizes[:10])/len(sizes[:10])) if sizes else int(400*1024**2*self.cfg['capture_width']*self.cfg['capture_height']/(640*480))
@@ -379,7 +383,7 @@ class Capture:
     def reconcile(self,jobs,eps=None):
         """에피소드를 바꿨으면 True. eps: 이미 읽어 둔 에피소드 목록."""
         by_id={j['id']:j for j in jobs}; changed=False
-        for ep in (self.db.all('episode') if eps is None else eps):
+        for ep in (self.active_episodes() if eps is None else eps):
             j=by_id.get(ep.get('export_job') or '')
             if not j or ep.get('local_deleted') or ep['id'] in self.transferring: continue
             if j.get('status')=='done' and ep.get('transfer_status')!='done':

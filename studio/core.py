@@ -1,9 +1,19 @@
 from __future__ import annotations
 import hashlib, json, os, re, sqlite3, threading, uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 def now(): return datetime.now(timezone.utc).isoformat()
+def overlap(cursor, seconds=5):
+    """'바뀐 것만' 읽을 때의 시작 시각: 지난번에 본 마지막 updated_at(cursor) 보다 조금 앞.
+    쓰는 중이던 기록을 놓치지 않게 겹쳐 읽는다 (같은 기록을 다시 받아도 덮어쓸 뿐). 커서를 읽을 수 없으면 None → 전체를 읽는다."""
+    try: return (datetime.fromisoformat(str(cursor))-timedelta(seconds=seconds)).isoformat()
+    except Exception: return None
+def newest(rows, cursor=None):
+    """rows 의 가장 늦은 updated_at (cursor 보다 이르면 cursor) — 다음 '바뀐 것만' 요청의 커서."""
+    stamps=[str(r['updated_at']) for r in rows if r.get('updated_at')]
+    if cursor: stamps.append(str(cursor))
+    return max(stamps) if stamps else None
 def uid(prefix=''): return prefix + uuid.uuid4().hex
 
 def safe_id(value):
@@ -37,6 +47,12 @@ class Store:
             if 'station' not in cols:
                 c.execute('ALTER TABLE events ADD COLUMN station TEXT')
             c.execute('CREATE INDEX IF NOT EXISTS events_episode ON events(episode)')
+            # 기록이 수천 건이 되면 목록 전체를 읽어 JSON 을 푸는 데만 수백 ms 가 든다 (화면이 2초마다 묻는다).
+            # '그 뒤에 바뀐 것만'(updated_at) · '이 PC 에 원본이 남은 것만'(local_deleted) 을 색인으로 바로 찾는다. 없어도 동작은 같다 (느릴 뿐)
+            try:
+                c.execute("CREATE INDEX IF NOT EXISTS records_updated ON records(kind, json_extract(body,'$.updated_at'))")
+                c.execute("CREATE INDEX IF NOT EXISTS records_active ON records(kind, coalesce(json_extract(body,'$.local_deleted'),0))")
+            except sqlite3.Error: pass
     def connect(self): return sqlite3.connect(self.path, timeout=30)
     def get(self, kind, key):
         with self.connect() as c:
@@ -50,10 +66,17 @@ class Store:
     def patch(self, kind, key, **changes):
         with self.lock:
             return self.put(kind,key,dict(self.get(kind,key) or {},**changes))
-    def all(self, kind, drop=()):
-        """drop: 빼고 읽을 최상위 키 (예: 에피소드마다 복사된 calibration). SQLite 가 빼고 주므로 읽기 · JSON 풀기가 빨라진다."""
+    def all(self, kind, drop=(), since=None, active=False, limit=None):
+        """최근에 바뀐 것부터. drop: 빼고 읽을 최상위 키 (예: 에피소드마다 복사된 calibration). SQLite 가 빼고 주므로 읽기 · JSON 풀기가 빨라진다.
+        since: updated_at 이 이 시각보다 늦은 것만 · active: local_deleted 가 아닌 것만 · limit: 앞에서부터 몇 건만
+        (조건식은 __init__ 의 색인과 글자까지 같아야 색인을 탄다)"""
         col='json_remove(body,'+','.join('?'*len(drop))+')' if drop else 'body'
-        with self.connect() as c: rows=c.execute('SELECT '+col+' FROM records WHERE kind=? ORDER BY rowid DESC',(*('$.'+k for k in drop),kind)).fetchall()
+        sql='SELECT '+col+' FROM records WHERE kind=?'; args=[*('$.'+k for k in drop),kind]
+        if since: sql+=" AND json_extract(body,'$.updated_at')>?"; args.append(str(since))
+        if active: sql+=" AND coalesce(json_extract(body,'$.local_deleted'),0)=0"
+        sql+=' ORDER BY rowid DESC'
+        if limit: sql+=' LIMIT ?'; args.append(int(limit))
+        with self.connect() as c: rows=c.execute(sql,args).fetchall()
         return [json.loads(r[0]) for r in rows]
     def log(self, entity, message, level='info', episode=None, station=None):
         if episode is None and str(entity).startswith('ep_'): episode=entity   # 에피소드 로그는 entity 가 에피소드 ID

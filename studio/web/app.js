@@ -97,7 +97,22 @@ function renderWorkerLogs(list){const f=['wlog-episode','wlog-q','wlog-level'].s
  $('wlogs').innerHTML=list.map(l=>'<div class="log '+esc(l.level)+'"><time>'+esc(fmtDate(l.at))+'</time><span>'+esc(String(l.level).toUpperCase())+'</span><span class="log-ep">'+(l.episode?'<button type="button" class="ep-chip" data-wep="'+esc(l.episode)+'" title="이 에피소드 로그만 보기">'+esc(l.episode)+'</button>':'')+'</span><span><span class="log-src">'+esc(l.source||'')+'</span> '+esc(names[l.message]||l.message)+'</span></div>').join('')||'<div class="empty">'+(f?'조건에 맞는 로그가 없습니다.':'아직 로그가 없습니다.')+'</div>';
  document.querySelectorAll('[data-wep]').forEach(b=>b.onclick=()=>{$('wlog-episode').value=b.dataset.wep;onWorkerLogFilter()})}
 function onWorkerLogFilter(){clearTimeout(wlogTimer);wlogTimer=setTimeout(fetchWorkerLogs,250)}
-async function refresh(){if(polling)return;polling=true;try{state=await api('/state');if(logFilter())await fetchLogs();render();if(view==='logs')fetchWorkerLogs()}catch(e){if(!$('app').hidden){$('connection').hidden=false;$('connection').textContent='연결이 끊겼습니다. 재연결 중 · '+e.message}}finally{polling=false}}
+// 상태 갱신 — 에피소드 · NAS 작업 목록은 처음 한 번만 전체를 받고, 그 뒤로는 '그 뒤에 바뀐 것만' 받아 여기서 합친다.
+// (기록이 수천 건이면 전체는 수 MB — 2초마다 받아 풀면 화면이 끊긴다.) 서버가 다시 켜지면 epoch 가 달라져 전체를 다시 받는다.
+let epAll=new Map(),jobAll=new Map(),stCursor='',stJCursor='',stEpoch='';
+const byUpdated=(a,b)=>String(b.updated_at||'').localeCompare(String(a.updated_at||''));
+// 받은 줄을 표에 합친다. 실제로 달라진 줄이 있었으면 true (서버는 놓치지 않게 최근 몇 초 것을 겹쳐 보내므로 같은 줄이 다시 올 수 있다)
+function mergeRows(map,rows,full){let changed=full;if(full)map.clear();for(const r of rows){const p=map.get(r.id);if(!p||p.updated_at!==r.updated_at)changed=true;map.set(r.id,r)}return changed}
+function mergeState(d){
+ // 예전 서버(episodes_full 이 없음)는 늘 전체를 준다 → 전체로 다룬다
+ const epChanged=mergeRows(epAll,d.episodes||[],d.episodes_full!==false),jobChanged=mergeRows(jobAll,d.jobs||[],d.jobs_full!==false);
+ stCursor=d.cursor||'';stJCursor=d.jcursor||'';stEpoch=d.epoch||'';
+ // 바뀐 게 없으면 같은 배열을 그대로 쓴다 (jobFor 의 표를 다시 만들지 않게). 순서는 서버와 같이 최근에 바뀐 것부터
+ d.episodes=!state||epChanged?[...epAll.values()].sort(byUpdated):state.episodes;
+ d.jobs=!state||jobChanged?[...jobAll.values()].sort(byUpdated):state.jobs;
+ return d}
+function stateUrl(){const p=new URLSearchParams();if(stEpoch){p.set('epoch',stEpoch);if(stCursor)p.set('since',stCursor);if(stJCursor)p.set('jsince',stJCursor)}const q=p.toString();return '/state'+(q?'?'+q:'')}
+async function refresh(){if(polling)return;polling=true;try{state=mergeState(await api(stateUrl()));if(logFilter())await fetchLogs();render();if(view==='logs')fetchWorkerLogs()}catch(e){if(!$('app').hidden){$('connection').hidden=false;$('connection').textContent='연결이 끊겼습니다. 재연결 중 · '+e.message}}finally{polling=false}}
 // QC 결과 — 위에 종합 판정, 아래 항목마다 한 줄(핵심 수치). 원문 상세는 펼쳐서 본다. 문제 있는 항목이 먼저, 펼쳐진 채로.
 const QC_ORDER={FAIL:0,WARN:1,SKIP:2,PASS:3};
 function qcSummary(c){const d=String(c.detail||''),g=r=>{const m=d.match(r);return m?m[1]:null},j=a=>a.filter(Boolean).join('  ·  ');
