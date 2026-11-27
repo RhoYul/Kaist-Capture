@@ -38,7 +38,7 @@ function render(){
   if(!c?.connected)clearPreview(n)}   // 끊긴 카메라는 마지막 화면을 남기지 않는다
  {const w=state.cameras.filter(c=>c.warning||(!c.connected&&c.error)).map(c=>'<div>⚠ <b>'+esc(c.camera_id)+'</b> ('+esc(c.serial)+'): '+esc(c.warning||c.error)+'</div>');if($('cam-warn')){$('cam-warn').hidden=!w.length;$('cam-warn').innerHTML=w.join('')}}
  const cal=state.calibration,calOld=state.calibration_mismatch;$('calib-status').textContent=calOld?'⚠ 촬영 해상도가 '+(state.resolution||'')+' 로 바뀌었습니다 — 캘리브레이션을 다시 하세요 (지금 결과는 '+calOld+' 기준)':cal?.confirmed?'✓ 캘리브레이션 확인 완료':'○ 캘리브레이션 결과 확인 필요';$('calib-status').classList.toggle('error',!!calOld);const pend=state.pending,full=!!pend&&pend.limit>0&&pend.total>=pend.limit;$('record').disabled=!!state.busy||!cal?.confirmed||!!calOld||full||state.cameras.filter(c=>c.connected).length!==4||!$('task-select').value;if(state.durations?.length&&!state.durations.includes(recSeconds))recSeconds=state.durations[0];document.querySelectorAll('[data-sec]').forEach(b=>{b.hidden=!!state.durations?.length&&!state.durations.includes(Number(b.dataset.sec));b.classList.toggle('active',Number(b.dataset.sec)===recSeconds);b.disabled=!!state.busy});
- $('record').textContent=state.busy==='recording'?(live?.phase==='recording'?'● 촬영 중…':live?.phase==='saving'?'원본 저장 중…':'촬영 준비 중…'):full?'대기 '+pend.total+'/'+pend.limit+' — QC · 검수 먼저':'● '+recSeconds+'초 촬영 시작';$('record').classList.toggle('recording',state.busy==='recording');if(state.live?.active)startLive();
+ $('record').textContent=state.busy==='recording'?(live?.phase==='recording'?'● 촬영 중…':live?.phase==='saving'?'원본 저장 중…':live?.phase==='countdown'?'카운트다운…':'촬영 준비 중…'):full?'대기 '+pend.total+'/'+pend.limit+' — QC · 검수 먼저':'● '+recSeconds+'초 촬영 시작';$('record').classList.toggle('recording',state.busy==='recording');if(state.live?.active)startLive();
  if(pend&&$('pending-info')){$('pending-info').innerHTML='보내지 않은 촬영 <b>'+pend.total+'</b> / '+pend.limit+' · QC 전 '+pend.need_qc+' · QC 중 '+pend.in_qc+' · 검수 필요 '+pend.review+(pend.auto_export?'<br><small class="muted">QC 전체 PASS 는 자동으로 NAS 전송 · WARN/FAIL 은 검수 후 전송'+(pend.qc_on_export?' · QC 는 export 서버에서 (녹화 중엔 잠깐 멈춤)':'')+'</small>':'');$('pending-info').classList.toggle('error',full);$('qc-batch').disabled=!pend.need_qc||state.busy==='qc';$('qc-batch').textContent='QC 일괄 실행'+(pend.need_qc?' ('+pend.need_qc+')':'')}$('snapshot').disabled=!!state.busy;$('compute').disabled=!!state.busy||state.captures<5;$('capture-count').textContent=state.captures+' / 5';$('calib-summary').textContent=cal?.confirmed?'확인 완료 · 카메라 이동 시 다시 보정':'기존 ChArUco 방식';
  $('calib-result').innerHTML=cal?'<div class="calib-values">'+Object.entries(cal.reprojectionErrors||{}).map(([c,e])=>'<span class="badge '+(e>.7?'warn':'success')+'">'+esc(c)+' · '+esc(e)+' px</span>').join('')+'<button id="confirm-calib" '+(state.busy?'disabled':'')+'>'+ (cal.confirmed?'확인 완료 ✓':'수치 확인 · 촬영 준비 완료')+'</button></div>':'';
  if($('confirm-calib'))$('confirm-calib').onclick=()=>action(()=>api('/calibration/confirm','POST'),'캘리브레이션을 확인했습니다.');
@@ -161,7 +161,7 @@ $('delete-episode').onclick=()=>{const ep=state.episodes.find(e=>e.id===selected
 for(const id of ['log-episode','log-q'])$(id).oninput=onLogFilter;for(const id of ['log-level','log-station'])$(id).onchange=onLogFilter;
 $('log-clear').onclick=()=>{for(const id of ['log-episode','log-q','log-level','log-station'])$(id).value='';filteredLogs=null;renderLogs()};$('snapshot').onclick=()=>action(()=>api('/calibration/snapshot','POST'),'보드 프레임을 캡처했습니다.');$('reset-calib').onclick=()=>action(()=>api('/calibration/reset','POST'),'보드 캡처를 초기화했습니다.');
 $('calib-form').onsubmit=e=>{e.preventDefault();const d=Object.fromEntries(new FormData(e.target));for(const k of ['squares_x','squares_y','square_length_mm','marker_length_mm'])d[k]=Number(d[k]);action(()=>api('/calibration/compute','POST',d),'계산 완료. 오차를 확인하고 승인하세요.')};
-$('record').onclick=()=>{const s=recSeconds;startLive(true);action(async()=>{try{await api('/capture/'+encodeURIComponent($('task-select').value)+'?seconds='+s,'POST')}catch(e){stopLive();throw e}},s+'초 촬영 — 첫 프레임이 기록되는 순간부터 초를 셉니다.')};
+$('record').onclick=()=>{const s=recSeconds;startLive(true);action(async()=>{try{await api('/capture/'+encodeURIComponent($('task-select').value)+'?seconds='+s,'POST')}catch(e){stopLive();throw e}},s+'초 촬영 — 카운트다운이 끝나면 녹화를 시작합니다.')};
 document.querySelectorAll('[data-sec]').forEach(b=>b.onclick=()=>{if(state?.busy)return;recSeconds=Number(b.dataset.sec);try{localStorage.setItem('rec_seconds',String(recSeconds))}catch(e){}if(state)render()});
 $('fullscreen').onclick=()=>{if(document.fullscreenElement){document.exitFullscreen()}else{const p=$('camera-panel').requestFullscreen?.();if(p)p.catch(e=>toast('전체 화면을 열 수 없습니다: '+e.message,true))}};
 document.addEventListener('fullscreenchange',()=>{$('fullscreen').textContent=document.fullscreenElement?'✕ 전체 화면 닫기':'⛶ 전체 화면';fitStage()});
@@ -173,15 +173,21 @@ window.addEventListener('resize',fitStage);
 // 0.15초마다 /api/capture/live 를 묻고, 그 사이는 서버 시계와의 차이(liveOffset)로 매 화면마다 다시 그린다.
 let live=null,liveOffset=0,livePoll=null,liveRaf=0,liveHide=null,liveWaiting=false;
 function startLive(waiting){clearTimeout(liveHide);if(waiting){liveWaiting=true;live={phase:'preparing',seconds:recSeconds,fps:30,frames:null};drawLive()}if(!livePoll)pollLive()}
-function stopLive(){clearTimeout(livePoll);livePoll=null;live=null;liveWaiting=false;cancelAnimationFrame(liveRaf);$('rec-timer').hidden=true;$('stage').classList.remove('recording')}
+function stopLive(){clearTimeout(livePoll);livePoll=null;live=null;liveWaiting=false;cancelAnimationFrame(liveRaf);$('rec-timer').hidden=true;$('countdown').hidden=true;$('stage').classList.remove('recording')}
 async function pollLive(){livePoll=-1;try{const t0=Date.now(),d=await api('/capture/live'),t1=Date.now();liveOffset=d.server_now-(t0+t1)/2000;
   if(d.active){liveWaiting=false;live=d;drawLive();livePoll=setTimeout(pollLive,150);return}
   if(liveWaiting){livePoll=setTimeout(pollLive,150);return}   // 시작 요청이 아직 서버에 닿기 전
   const last=live;livePoll=null;if(last&&last.phase!=='preparing'){live=Object.assign({},last,{phase:'done'});drawLive();liveHide=setTimeout(stopLive,4000)}else stopLive()}
  catch(e){livePoll=setTimeout(pollLive,500)}}
-function drawLive(){cancelAnimationFrame(liveRaf);const lv=live,box=$('rec-timer');if(!lv){box.hidden=true;return}
+function drawLive(){cancelAnimationFrame(liveRaf);const lv=live,box=$('rec-timer');if(!lv){box.hidden=true;$('countdown').hidden=true;return}
  box.hidden=false;box.className='rec-timer '+lv.phase;$('stage').classList.toggle('recording',lv.phase==='recording');
  const total=lv.seconds,fps=lv.fps||30;$('rt-total').textContent='/ '+total+'초';
+ // 녹화 전 3초 카운트다운: 촬영자가 볼 수 있게 화면 전체에 큰 숫자 (그동안 서버는 실제 녹화와 같은 처리를 돌려 안정시킨다 · 저장 안 함)
+ $('countdown').hidden=lv.phase!=='countdown';
+ if(lv.phase==='countdown'){box.hidden=true;
+  const left=lv.go?Math.max(0,lv.go-(Date.now()/1000+liveOffset)):(lv.countdown||3);
+  $('cd-num').textContent=String(Math.max(1,Math.ceil(left)));
+  liveRaf=requestAnimationFrame(drawLive);return}
  let el=0;if(lv.started&&lv.phase==='recording')el=Math.max(0,Math.min(total,Date.now()/1000+liveOffset-lv.started));else if(lv.phase==='saving'||lv.phase==='done')el=total;
  $('rt-elapsed').textContent=el.toFixed(1);$('rt-progress').style.width=(el/total*100)+'%';
  $('rt-phase').textContent=lv.phase==='preparing'?'○ 카메라 첫 프레임 기다리는 중…':lv.phase==='recording'?'● REC · 프레임 기록 중 · 남은 '+(total-el).toFixed(1)+'초':lv.phase==='saving'?'■ 촬영 끝 · 원본 저장 중':'✓ 촬영 완료';

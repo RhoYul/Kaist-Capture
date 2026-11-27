@@ -269,6 +269,54 @@ class WarmRecordingTests(unittest.TestCase):
             cam = warm.WarmCamera("cam_1", "S1"); _, pipe = cam._start(rs, rs.pipeline(), "cfg"); self.assertIsNone(cam._fq)
         finally: warm.SDK_QUEUE = old
 
+    # ── 프리롤 (녹화 전 카운트다운): 실제 녹화와 같은 처리를 하되 에피소드에는 쓰지 않는다 ──
+    def test_preroll_frames_go_through_real_path_but_not_into_episode(self):
+        pre = self.out / "pre"; ep = self.out / "ep"; ep.mkdir()
+        r = warm._Recording("S1", ep, "cam_1", INTR, go_at=time.time() - 1, rec_at=time.time() + 0.3, preroll_dir=pre)
+        warmup = [_Frames(i) for i in (0, 1, 2, 5, 6)]           # 프리롤 중 3 · 4 번을 받지 못함 (진단용으로만 센다)
+        for f in warmup: r.offer(f, _Align(), np)
+        self.assertIsNone(r.first_at); self.assertEqual(r.accepted, 0)
+        time.sleep(0.35)                                         # 카운트다운 끝
+        for i in range(7, 10): r.offer(_Frames(i), _Align(), np)
+        self.assertTrue(all(f.kept for f in warmup))             # 프리롤도 실제 녹화와 같이 붙잡아 넘긴다
+        r.close(); _wait_done(r); r.pre_rec._writer_thread.join(10)
+        self.assertGreaterEqual(r.first_at, r.rec_at)
+        self.assertEqual((r.rec._out["frame_count"], r.missing, r.accepted), (3, 0, 3))   # 프리롤 → 녹화 사이 간격은 누락이 아님
+        self.assertEqual((r.warmed, r.pre_missing), (5, 2))
+        np.testing.assert_array_equal(np.load(ep / "cam_1_depth" / "frame_000000.npy"), np.full((480, 640), 507, np.uint16))
+        self.assertEqual(len(list((pre / "cam_1_depth").glob("*.npy"))), 5)   # 프리롤은 mp4 · npy 를 프리롤 폴더에 실제로 쓴다
+        self.assertEqual(r.pre_rec._out["frame_count"], 5)
+
+    def test_session_preroll_delays_recording_and_cleans_up(self):
+        svc = _Service(); s = warm.WarmSession(svc); pre = self.out / "preroll" / "ep"
+        t0 = time.time(); s.start(self.out / "ep", seconds=5, preroll=0.3, preroll_dir=pre)
+        self.assertAlmostEqual(s.rec_at, t0 + 0.35, delta=0.05)
+        self.assertTrue(all(c._recording.rec_at == s.rec_at for c in svc._cameras.values()))
+        self.assertTrue(all(c._recording._raw.maxsize >= 30 * 7 for c in svc._cameras.values()))
+        stop = threading.Event()
+        def feed(cam):
+            i = 0
+            while not stop.is_set():
+                rec = cam._recording
+                if rec: rec.offer(_Frames(i), _Align(), np); i += 1
+                time.sleep(1 / 30)
+        ts = [threading.Thread(target=feed, args=(c,), daemon=True) for c in svc._cameras.values()]
+        [t.start() for t in ts]
+        with self.assertRaises(RuntimeError): s.wait_first(timeout=0.15)   # 카운트다운 중에는 기록하지 않는다
+        first = s.wait_first(timeout=2); self.assertGreaterEqual(first, s.rec_at)
+        time.sleep(0.2); res = s.stop(); stop.set()
+        self.assertTrue(all("error" not in r and r["frame_count"] > 0 and r["preroll_frames"] > 0 for r in res.values()), res)
+        self.assertTrue(pre.exists() or s.preroll_cleanup is not None)
+        s.preroll_cleanup.join(10)
+        self.assertFalse(pre.exists())                           # 프리롤 폴더는 녹화가 끝나면 지운다
+        self.assertTrue((self.out / "ep" / "cam_1.mp4").exists())
+
+    def test_session_without_preroll_is_unchanged(self):
+        svc = _Service(); s = warm.WarmSession(svc); s.start(self.out)
+        r = svc._cameras["cam_1"]._recording
+        self.assertEqual(r.rec_at, r.go_at); self.assertIsNone(r.pre_rec); self.assertIsNone(s._preroll_dir)
+        s.stop()
+
     def test_session_refuses_when_a_camera_has_no_video(self):
         svc = _Service(); svc._cameras["cam_3"].get_status = lambda: {"connected": False}
         with self.assertRaises(RuntimeError): warm.WarmSession(svc).start(self.out)

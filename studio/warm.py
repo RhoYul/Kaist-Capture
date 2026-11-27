@@ -204,10 +204,21 @@ class _Recording:
     RAW_MAX = 300   # 카메라 1대 10초 분량 (기본 · 녹화 길이가 길면 WarmSession 이 늘린다)
 
     def __init__(self, serial: str, out_dir: Path, cam_name: str, intr: dict, go_at: float, raw_max: int = 0,
-                 grid: Optional[_Grid] = None) -> None:
+                 grid: Optional[_Grid] = None, rec_at: Optional[float] = None, preroll_dir: Optional[Path] = None) -> None:
         self.rec = rv.RealSenseRecorder(serial)
         self.cam_name = cam_name
         self.go_at = go_at
+        # 프리롤 (카운트다운): go_at ~ rec_at 사이 프레임은 실제 녹화와 같은 길(붙잡기 · 정렬 · 복사 · mp4 · npy 쓰기)로 처리하되
+        # 에피소드가 아니라 preroll_dir 에 쓰고 버린다. 녹화를 시작한 직후 몇 초 동안 처리가 덜 풀려 프레임이 빠지는 것을
+        # 카운트다운 동안 미리 겪게 한다 (실측 2026-11-27: 빠진 프레임이 전부 녹화 시작 후 약 4.5초 안).
+        self._rec_at = rec_at     # None = 프리롤 없음 (go_at 부터 바로 기록)
+        self.warmed = 0           # 프리롤로 처리한 프레임 수
+        self.pre_missing = 0      # 프리롤 동안 받지 못한 프레임 (진단용 · 에피소드에는 영향 없음)
+        self._pre_last_hw: Optional[float] = None
+        self._pre: Optional[rv.RealSenseRecorder] = None   # 프리롤 쓰기 (끝나면 None)
+        self.pre_rec: Optional[rv.RealSenseRecorder] = None
+        if preroll_dir is not None and self.rec_at > go_at:
+            self.pre_rec = self._pre = self._writer(Path(preroll_dir), cam_name, serial, "rs-preroll")
         self.grid = grid          # 4대 공통 시간 격자 (없으면 예전처럼 받은 순서대로 번호를 매긴다)
         self.filled = 0           # 받지 못해 가까운 프레임으로 채운 슬롯 수 (정상이면 0)
         self._anchor = None       # 격자 기준 시각 ms (0번 슬롯의 시각)
@@ -224,10 +235,24 @@ class _Recording:
         self.done = False         # 처리 · 쓰기 큐 넣기까지 끝남
         self._align = None
         self._raw: "queue.Queue" = queue.Queue(maxsize=max(self.RAW_MAX, int(raw_max or 0)))
+        self._writer(out_dir, cam_name, serial, "rs-writer", self.rec)
+        self._intr = dict(intr, camera_name=cam_name)
+        self._intr_written = False
+        self._proc = threading.Thread(target=self._process_loop, daemon=True, name=f"rs-process-{serial[-6:]}")
+        self._proc.start()
+
+    @property
+    def rec_at(self) -> float:
+        """에피소드에 기록하기 시작하는 시각 (이 시각 전 프레임은 프리롤)."""
+        return self.go_at if self._rec_at is None else max(self.go_at, self._rec_at)
+
+    @staticmethod
+    def _writer(out_dir: Path, cam_name: str, serial: str, thread_name: str, rec=None):
+        """원본 RealSenseRecorder 의 쓰기 스레드를 out_dir 로 시작한다 (원본 RealSenseRecorder.start 와 같은 출력 경로)."""
+        rec = rec or rv.RealSenseRecorder(serial)
         depth_dir = out_dir / f"{cam_name}_depth"
         depth_dir.mkdir(parents=True, exist_ok=True)
-        # 원본 RealSenseRecorder.start 와 같은 출력 경로
-        self.rec._out = {
+        rec._out = {
             "color_path":      str(out_dir / f"{cam_name}.mp4"),
             "depth_dir":       str(depth_dir),
             "depth_format":    "npy",
@@ -235,14 +260,11 @@ class _Recording:
             "timestamps_path": str(out_dir / f"{cam_name}_timestamps.csv"),
             "frame_count":     0,
         }
-        self._intr = dict(intr, camera_name=cam_name)
-        self._intr_written = False
-        self.rec._running = True
-        self.rec._writer_thread = threading.Thread(target=self.rec._write_loop, args=(cam_name,), daemon=True,
-                                                   name=f"rs-writer-{serial[-6:]}")
-        self.rec._writer_thread.start()
-        self._proc = threading.Thread(target=self._process_loop, daemon=True, name=f"rs-process-{serial[-6:]}")
-        self._proc.start()
+        rec._running = True
+        rec._writer_thread = threading.Thread(target=rec._write_loop, args=(cam_name,), daemon=True,
+                                              name=f"{thread_name}-{serial[-6:]}")
+        rec._writer_thread.start()
+        return rec
 
     def offer(self, frames, align, np=None) -> None:
         """카메라 스레드에서 프레임마다 호출 — 가볍게: 붙잡아 큐에 넣기만 한다."""
@@ -252,13 +274,18 @@ class _Recording:
         if self.stop_at is not None and host_t >= self.stop_at:
             self.close(); return
         self._align = align
+        warm_up = host_t < self.rec_at          # 프리롤 (카운트다운) 프레임 — 처리만 하고 에피소드에는 쓰지 않는다
         try:
             frames.keep()                      # 다음 wait_for_frames 뒤에도 이 프레임을 쓸 수 있게
             self._raw.put_nowait((frames, host_t))
+            if warm_up:
+                return
             if self.first_at is None:
                 self.first_at = host_t
             self.accepted += 1
         except queue.Full:
+            if warm_up:
+                return
             self.dropped += 1
             logger.warning(f"{self.rec.serial}: 처리 큐 가득 참 — 프레임 드롭 (총 {self.dropped})")
 
@@ -283,6 +310,10 @@ class _Recording:
                 if item is None:
                     break
                 frames, host_t = item
+                if host_t < self.rec_at:
+                    self._warm(frames, host_t, slot_ms)
+                    continue
+                self._end_preroll()
                 slot = None
                 if self.grid is not None:
                     slot = self._slot(frames, host_t)
@@ -328,6 +359,30 @@ class _Recording:
                     break
             self.finish()
 
+    def _warm(self, frames, host_t: float, slot_ms: float) -> None:
+        """프리롤 프레임: 실제 녹화와 같은 정렬 · 복사 · 쓰기를 프리롤 폴더에 한다 (나중에 지운다)."""
+        import numpy as np
+        frames = self._align.process(frames)
+        color = frames.get_color_frame(); depth = frames.get_depth_frame()
+        if not color or not depth:
+            return
+        hw_ts = color.get_timestamp()
+        if self._pre_last_hw is not None:
+            gap = int(round((hw_ts - self._pre_last_hw) / slot_ms))
+            if gap > 1: self.pre_missing += gap - 1
+        self._pre_last_hw = hw_ts
+        color_img = np.asanyarray(color.get_data()).copy()
+        depth_img = np.asanyarray(depth.get_data()).copy()
+        if self._pre is not None:
+            self._pre._frame_queue.put((self.warmed, color_img, depth_img, hw_ts, host_t), timeout=60)
+        self.warmed += 1
+
+    def _end_preroll(self) -> None:
+        """프리롤 쓰기 스레드에 종료 신호 (녹화 첫 프레임 · 녹화 종료 때 한 번)."""
+        pre, self._pre = self._pre, None
+        if pre is not None:
+            pre._frame_queue.put(None, timeout=60)
+
     def _put(self, idx: int, frame: tuple) -> None:
         # 쓰기 스레드가 밀리면 여기서 기다린다 (버리지 않음 · 카메라 스레드는 영향 없음)
         self.rec._frame_queue.put((idx,) + frame, timeout=60)
@@ -370,6 +425,8 @@ class _Recording:
         """처리 스레드가 끝날 때 한 번: 쓰기 스레드에 종료 신호."""
         if self.done:
             return
+        try: self._end_preroll()
+        except Exception: logger.warning(f"[warm] {self.cam_name} 프리롤 쓰기 종료 신호 실패")
         if not self._intr_written:
             self._write_intrinsics()
         g = self.grid
@@ -382,6 +439,8 @@ class _Recording:
                     self.frame_idx = g.total
                 except Exception as e:
                     self.rec._capture_error = f"녹화 처리 오류: {e}"
+        if self.warmed:
+            logger.warning(f"{self.rec.serial}({self.cam_name}): 프리롤 {self.warmed}프레임 처리 · 프리롤 중 받지 못함 {self.pre_missing}")
         if self.dropped or self.missing or self.filled:
             logger.warning(f"{self.rec.serial}({self.cam_name}): {self.frame_idx}프레임 저장 · 받지 못함 {self.missing} · 채움 {self.filled} · 처리 큐 드롭 {self.dropped}")
         self.rec._frame_queue.put(None)   # 원본과 같은 종료 신호 → 쓰기 스레드가 큐를 비우고 끝난다
@@ -716,10 +775,16 @@ class WarmSession:
         self._recordings: Dict[str, _Recording] = {}
         self._recorders: list = []        # capture.py 가 쓰기 스레드가 끝났는지 볼 때 쓴다 (원본과 같은 이름)
         self._grid: Optional[_Grid] = None
+        self.rec_at: Optional[float] = None          # 에피소드 기록을 시작하는 시각 (프리롤 · 카운트다운이 끝나는 시각)
+        self._preroll_dir: Optional[Path] = None
+        self.preroll_cleanup: Optional[threading.Thread] = None
 
-    def start(self, out_dir, seconds: float = 0) -> List[str]:
+    def start(self, out_dir, seconds: float = 0, preroll: float = 0, preroll_dir=None) -> List[str]:
+        """preroll 초 동안은 실제 녹화와 같은 처리를 preroll_dir 에 하고 버린 뒤(카운트다운), 그 다음 프레임부터 기록한다.
+        preroll_dir 를 안 주면 out_dir 옆의 '.preroll_<에피소드>' 폴더 (녹화가 끝나면 지운다)."""
         out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
-        raw_max = int(rv.COLOR_FPS * (seconds + 2)) if seconds else 0   # 녹화 전체 + 2초 분량까지는 처리가 밀려도 버리지 않는다
+        preroll = max(0.0, float(preroll or 0))
+        raw_max = int(rv.COLOR_FPS * (seconds + preroll + 2)) if seconds else 0   # 녹화 전체 + 2초 분량까지는 처리가 밀려도 버리지 않는다
         cams = list(self.service._cameras.values())
         if not cams:
             raise RuntimeError("연결된 RealSense 기기가 없습니다")
@@ -728,11 +793,14 @@ class WarmSession:
                 raise RuntimeError(f"{c.camera_id} 영상이 들어오지 않습니다 — USB 연결 확인")
             if c._recording is not None:
                 raise RuntimeError(f"{c.camera_id} 이미 녹화 중")
-        go_at = time.time() + 0.05      # 4대가 같은 호스트 시각부터 기록
+        go_at = time.time() + 0.05      # 4대가 같은 호스트 시각부터 받는다 (프리롤이 있으면 프리롤부터)
+        self.rec_at = go_at + preroll   # 이 시각 뒤 프레임부터 에피소드에 기록
+        self._preroll_dir = (Path(preroll_dir) if preroll_dir else out_dir.parent / f".preroll_{out_dir.name}") if preroll else None
         # 4대 공통 시간 격자: 프레임 번호 = 시간 슬롯, 카메라마다 정확히 seconds × FPS 장
         self._grid = _Grid(rv.COLOR_FPS, len(cams), int(round(seconds * rv.COLOR_FPS)) if seconds else None)
         for c in cams:
-            r = _Recording(c.serial, out_dir, c.camera_id, c._intr, go_at, raw_max, self._grid)
+            r = _Recording(c.serial, out_dir, c.camera_id, c._intr, go_at, raw_max, self._grid,
+                           rec_at=self.rec_at, preroll_dir=self._preroll_dir)
             self._recordings[c.camera_id] = r
             self._recorders.append(r.rec)
         for c in cams:
@@ -797,6 +865,24 @@ class WarmSession:
             t = r.rec._writer_thread
             if t: t.join(timeout=120.0)
             error = r.rec._capture_error or r.rec._writer_error
-            results[name] = {"error": f"{r.rec.serial}: {error}"} if error else dict(r.rec._out, missing=r.missing, dropped=r.dropped, filled=r.filled)
+            results[name] = {"error": f"{r.rec.serial}: {error}"} if error else dict(r.rec._out, missing=r.missing, dropped=r.dropped, filled=r.filled,
+                                                                                    preroll_frames=r.warmed, preroll_missing=r.pre_missing)
+        self._cleanup_preroll([r.pre_rec for r in self._recordings.values() if r.pre_rec is not None])
         self._recordings = {}
         return results
+
+    def _cleanup_preroll(self, writers) -> None:
+        """프리롤 폴더를 지운다 (쓰기 스레드가 끝난 뒤 · 뒤에서 — 저장 결과를 기다리게 하지 않는다)."""
+        d = getattr(self, "_preroll_dir", None)
+        if d is None:
+            return
+        self._preroll_dir = None
+        def run():
+            import shutil
+            for w in writers:
+                t = w._writer_thread
+                if t: t.join(timeout=60.0)
+            shutil.rmtree(d, ignore_errors=True)
+            if d.exists(): logger.warning(f"[warm] 프리롤 폴더를 지우지 못함: {d}")
+        self.preroll_cleanup = threading.Thread(target=run, daemon=True, name="warm-preroll-cleanup")
+        self.preroll_cleanup.start()

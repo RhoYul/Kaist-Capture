@@ -40,6 +40,9 @@ body.worker-mode .page-title,body.worker-mode .flow{display:none}
 .rt-bar i{display:block;height:100%;width:0;background:#ff5a4e}
 .rec-timer.done .rt-bar i{background:#3fbf8f}
 .rt-frames{font:12px Consolas,monospace;color:#b9d6c8;white-space:nowrap}
+.countdown{position:fixed;inset:0;z-index:60;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#0b1718cc;color:#fff;pointer-events:none}
+.countdown b{font:800 min(62vh,52vw)/1 Consolas,'Malgun Gothic',monospace;color:#f3c26b;font-variant-numeric:tabular-nums}
+.countdown span{font-size:clamp(20px,3.4vw,46px);font-weight:800;letter-spacing:-.5px;margin-top:1vh}
 .session-info{display:grid;grid-template-columns:1.4fr 1fr;gap:18px;align-items:start;padding:18px 22px}
 .session-info .task-object{margin:0 0 6px}
 @media(max-width:800px){.stage{height:auto;min-height:0}#camera-grid{height:auto;grid-template-rows:none}#camera-grid .cam{aspect-ratio:16/9;height:auto}.session-info{grid-template-columns:1fr}.cb-right{margin-left:0}.rec-btn{min-width:0;flex:1 1 100%}.rec-timer{min-width:240px}.rt-time b{font-size:48px}}

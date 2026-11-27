@@ -22,6 +22,9 @@ def epoch_iso(t):
 
 class Capture:
     DURATIONS=(5,10)   # 촬영 길이 (초) — 첫 프레임이 실제로 기록된 시각부터 센다
+    # 녹화 전 카운트다운 3초 (고정). 촬영자가 보도록 화면 전체에 3 · 2 · 1 을 띄우고, 그동안 실제 녹화와 같은 처리(정렬 · mp4 · npy 쓰기)를
+    # 버리는 폴더에 돌려 안정시킨다 (프리롤) → 녹화 시작 직후의 프레임 누락을 피한다 (실측 2026-11-27: 누락이 녹화 시작 후 약 4.5초 안에 몰림)
+    COUNTDOWN=3
     def __init__(self,cfg,db):
         self.cfg,self.db=cfg,db; self.root=Path(cfg['data_dir'])
         self.lock=threading.RLock(); self.busy=None; self.session=None; self.preview=None
@@ -149,7 +152,8 @@ class Capture:
             key=self.new_episode_id(); out=self.root/'episodes'/key; out.mkdir(parents=True)
             ep=dict(task_id=task['id'],task_name=task['name'],scene=task.get('scene','3D'),object=task_object(task),station=self.cfg['station'],demo=self.cfg['demo'],created_at=now(),status='preparing',duration=seconds,calibration=cal,transfer_status='not_sent')
             self.db.put('episode',key,ep); save_json(out/'extrinsics.json',public_extrinsics(cal))  # PhysicalAI 와 같은 키만
-            self.busy='recording'; self.live=dict(episode=key,seconds=seconds,fps=int(self.cfg['capture_fps']),phase='preparing',started=None,until=None)
+            self.busy='recording'; self.live=dict(episode=key,seconds=seconds,fps=int(self.cfg['capture_fps']),phase='preparing',started=None,until=None,
+                                                  countdown=self.COUNTDOWN,go=None)
             self.executor.submit(self._record,key)
             return self.db.get('episode',key)
     def live_status(self):
@@ -163,7 +167,10 @@ class Capture:
         out=self.root/'episodes'/key; seconds=int(self.db.get('episode',key).get('duration') or 5)
         try:
             self.db.log(key,f'{seconds}초 촬영 준비')
+            countdown=self.COUNTDOWN
             if self.cfg['demo']:
+                if countdown and self.cfg.get('demo_realtime'):
+                    self.live.update(phase='countdown',go=time.time()+countdown); time.sleep(countdown)
                 t0=time.time(); self.live.update(phase='recording',started=t0,until=t0+seconds)
                 self.db.patch('episode',key,status='recording',started_at=epoch_iso(t0))
                 if self.cfg.get('demo_realtime'): time.sleep(seconds)   # 데모에서 화면 타이머를 실제 시간으로 확인할 때
@@ -177,11 +184,17 @@ class Capture:
                 # 카메라는 이미 녹화 설정으로 열려 있다 → 닫았다 다시 열지 않고 지금 시각부터 4대가 함께 기록
                 self.notify_recording(True)     # 녹화 우선: 그동안 NAS 저장은 디스크를 쓰지 않고 기다린다
                 self.session=WarmSession(self.preview)
-                names=self.session.start(out,seconds=seconds)
+                # 카운트다운 동안은 실제 녹화와 같은 처리(정렬 · mp4 · npy 쓰기)를 프리롤 폴더에 하고 버린다 (녹화 시작 직후 프레임 누락 방지)
+                pre_root=self.root/'preroll'
+                for old in (pre_root.glob('*') if pre_root.exists() else []):
+                    if old.name!=key: shutil.rmtree(old,ignore_errors=True)   # 지난 녹화가 비정상 종료로 남긴 것
+                names=self.session.start(out,seconds=seconds,preroll=countdown,preroll_dir=pre_root/key)
                 if names!=CAMERAS: raise ValueError('4대 구성이 아닙니다')
+                if countdown:
+                    self.live.update(phase='countdown',go=self.session.rec_at)   # 화면에 큰 3 · 2 · 1 (에피소드 상태는 그대로 '촬영 준비')
                 # 버튼을 누른 시각이 아니라 4대 모두 첫 프레임이 실제로 기록된 시각부터 센다 → 카메라마다 정확히 seconds × FPS 장
                 # (프레임 번호는 4대 공통 시간 격자의 슬롯 번호 — warm._Grid)
-                first=self.session.wait_first(timeout=3.0)
+                first=self.session.wait_first(timeout=countdown+3.0)
                 until=self.session.schedule_stop(seconds)
                 self.live.update(phase='recording',started=first,until=until)
                 self.db.patch('episode',key,status='recording',started_at=epoch_iso(first))
@@ -200,6 +213,10 @@ class Capture:
                 # 받지 못한 프레임의 슬롯은 가까운 프레임으로 채워 번호(=시각)와 장수를 4대 똑같이 맞춘다 → 채운 수를 기록한다
                 filled={c:int(r.get('filled',0)) for c,r in results.items()}
                 self.db.patch('episode',key,frame_counts=counts,frames_lost=lost,frames_filled=filled)
+                if countdown:
+                    pre={c:int(r.get('preroll_missing',0)) for c,r in results.items()}
+                    self.db.patch('episode',key,preroll_seconds=countdown,preroll_lost=pre)
+                    self.db.log(key,f'카운트다운 {countdown}초 (프리롤 · 저장 안 함) 중 받지 못한 프레임: '+' · '.join(f'{c} {n}' for c,n in pre.items()))
                 # 카메라가 만들었는데 받지 못한 프레임 (하드웨어 시각 간격으로 계산). 정상이면 0
                 note=lambda c:' · '.join(x for x in (f'누락 {lost[c]}' if lost[c] else '',f'채움 {filled[c]}' if filled[c] else '') if x)
                 summary=' · '.join(f'{c} {counts[c]}장'+(f' ({note(c)})' if note(c) else '') for c in counts)
